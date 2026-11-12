@@ -32,7 +32,7 @@ import socket
 import ssl
 import subprocess
 import sys
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread
 import time
 from typing import Any
 from urllib.parse import urlencode, urljoin
@@ -269,6 +269,7 @@ class SamsungTVWS:
         self._ping_port = ping_port or 0
 
         self.connection = None
+        self._connection_lock = RLock()
         self._artmode_status = ArtModeStatus.Unsupported
         self._power_on_requested = False
         self._power_on_requested_time = datetime.min
@@ -400,11 +401,50 @@ class SamsungTVWS:
         use_control=False,
         ws_socket=None,
         raise_on_closed=False,
+        reuse_connection=False,
     ):
         """Send a command using the appropriate websocket."""
+        if use_control or self._ws_remote:
+            return self._ws_send_command(
+                command,
+                key_press_delay,
+                use_control=use_control,
+                ws_socket=ws_socket,
+                raise_on_closed=raise_on_closed,
+            )
+
+        # Without the remote channel (e.g. TV in standby) the cached connection
+        # can be dead without the socket knowing it: the send succeeds locally
+        # but the TV never gets the command, and later sends fail. Use a fresh
+        # connection for each command (a key release reuses the one of its
+        # press). Connect outside the lock, so that concurrent senders do not
+        # queue on each other's connection timeout, and use the lock only to
+        # replace the cached connection and send on it.
+        connection = None if reuse_connection else self._connect()
+        with self._connection_lock:
+            if connection is not None:
+                stale, self.connection = self.connection, connection
+                if stale is not None:
+                    # short timeout: a dead socket would never answer the close frame
+                    stale.close(timeout=1)
+            return self._ws_send_command(
+                command, key_press_delay, raise_on_closed=raise_on_closed, direct=True
+            )
+
+    def _ws_send_command(
+        self,
+        command,
+        key_press_delay=None,
+        *,
+        use_control=False,
+        ws_socket=None,
+        raise_on_closed=False,
+        direct=False,
+    ):
+        """Send a command on the websocket selected by the parameters."""
         using_remote = False
         if not use_control:
-            if self._ws_remote:
+            if self._ws_remote and not direct:
                 connection = self._ws_remote
                 using_remote = True
             else:
@@ -1020,9 +1060,12 @@ class SamsungTVWS:
 
     def open(self):
         """Open a WS client connection with the TV."""
-        if self.connection is not None:
-            return self.connection
+        if self.connection is None:
+            self.connection = self._connect()
+        return self.connection
 
+    def _connect(self):
+        """Open a new WS client connection with the TV, without storing it."""
         is_ssl = self._is_ssl_connection()
         url = self._format_websocket_url(_WS_ENDPOINT_REMOTE_CONTROL, is_ssl=is_ssl)
         sslopt = {"cert_reqs": ssl.CERT_NONE} if is_ssl else {}
@@ -1032,25 +1075,28 @@ class SamsungTVWS:
         completed = False
         response = ""
 
-        for _ in range(3):
-            response = _process_api_response(connection.recv())
-            _LOGGING.debug(response)
-            event = response.get("event", "-")
-            if event != "ms.channel.connect":
-                break
-            conn_data = response.get("data")
-            if self._check_conn_id(conn_data):
-                completed = True
-                token = conn_data.get("token")
-                if token:
-                    self._set_token(token)
-                break
+        try:
+            for _ in range(3):
+                response = _process_api_response(connection.recv())
+                _LOGGING.debug(response)
+                event = response.get("event", "-")
+                if event != "ms.channel.connect":
+                    break
+                conn_data = response.get("data")
+                if self._check_conn_id(conn_data):
+                    completed = True
+                    token = conn_data.get("token")
+                    if token:
+                        self._set_token(token)
+                    break
+        finally:
+            if not completed:
+                # the connection is not stored, close it here
+                connection.close(timeout=0)
 
         if not completed:
-            self.close()
             raise ConnectionFailure(response)
 
-        self.connection = connection
         return connection
 
     def close(self):
@@ -1074,13 +1120,16 @@ class SamsungTVWS:
                 },
             },
             key_press_delay,
+            reuse_connection=cmd == "Release",
         )
 
     def hold_key(self, key, seconds):
         """Send a key to the TV and keep it pressed for specific number of seconds"""
-        if self.send_key(key, key_press_delay=0, cmd="Press"):
-            time.sleep(seconds)
-            return self.send_key(key, key_press_delay=0, cmd="Release")
+        # keep the lock so that the release is sent on the press connection
+        with self._connection_lock:
+            if self.send_key(key, key_press_delay=0, cmd="Press"):
+                time.sleep(seconds)
+                return self.send_key(key, key_press_delay=0, cmd="Release")
         return False
 
     def send_text(self, text, send_delay=None):
@@ -1089,27 +1138,30 @@ class SamsungTVWS:
             return False
 
         base64_text = self._serialize_string(text)
-        if self._ws_send(
-            {
-                "method": "ms.remote.control",
-                "params": {
-                    "Cmd": f"{base64_text}",
-                    "DataOfCmd": "base64",
-                    "TypeOfRemote": "SendInputString",
-                },
-            },
-            key_press_delay=send_delay,
-        ):
-            self._ws_send(
+        # keep the lock so that the input end is sent on the same connection
+        with self._connection_lock:
+            if self._ws_send(
                 {
                     "method": "ms.remote.control",
                     "params": {
-                        "TypeOfRemote": "SendInputEnd",
+                        "Cmd": f"{base64_text}",
+                        "DataOfCmd": "base64",
+                        "TypeOfRemote": "SendInputString",
                     },
                 },
-                key_press_delay=0,
-            )
-            return True
+                key_press_delay=send_delay,
+            ):
+                self._ws_send(
+                    {
+                        "method": "ms.remote.control",
+                        "params": {
+                            "TypeOfRemote": "SendInputEnd",
+                        },
+                    },
+                    key_press_delay=0,
+                    reuse_connection=True,
+                )
+                return True
 
         return False
 
